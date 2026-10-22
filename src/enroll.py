@@ -1,8 +1,9 @@
 # src/enroll.py
 """
-Enrollment: camera -> Haar5ptDetector -> align_face_5pt (112x112) -> ArcFace embedding.
-Stores the mean L2-normalized embedding per identity in data/db/face_db.npz,
-read by WholePersonTracker's FaceDBMatcher (src/face_pipeline.py).
+Enrollment: camera -> MultiFaceDetector (BlazeFace + FaceLandmarker 5pt) ->
+align_face_5pt (112x112) -> ArcFace embedding. Stores the mean L2-normalized
+embedding per identity in data/db/face_db.npz, read by WholePersonTracker's
+FaceDBMatcher (src/face_pipeline.py).
 
 Run:
     python -m src.enroll
@@ -23,9 +24,9 @@ from typing import Dict, List
 import cv2
 import numpy as np
 
+from .align import align_face_5pt
 from .camera import pick_camera_index
-from .face_pipeline import ArcFaceEmbedderONNX, load_db_npz
-from .haar_5pt import Haar5ptDetector, align_face_5pt
+from .face_pipeline import ArcFaceEmbedderONNX, MultiFaceDetector, load_db_npz
 
 DB_PATH = Path("data/db/face_db.npz")
 SAMPLES_NEEDED = 15
@@ -47,7 +48,7 @@ def main():
         print("No name provided. Exiting.")
         return
 
-    det = Haar5ptDetector(min_size=(70, 70), smooth_alpha=0.80)
+    det = MultiFaceDetector()
     embedder = ArcFaceEmbedderONNX()
     db = load_db_npz(DB_PATH)
     samples: List[np.ndarray] = []

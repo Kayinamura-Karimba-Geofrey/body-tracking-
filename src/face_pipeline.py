@@ -1,8 +1,9 @@
 # src/face_pipeline.py
 """
-Multi-face detect + embed + match stack, trimmed from face-recognition/src/recognize.py:
-Haar (multi-face) -> MediaPipe FaceLandmarker 5pt (per-face ROI) -> align_face_5pt (112x112)
--> ArcFace ONNX embedding -> cosine distance to DB.
+Multi-face detect + embed + match stack:
+MediaPipe FaceDetector (BlazeFace, multi-face) -> MediaPipe FaceLandmarker 5pt
+(per-face ROI) -> align_face_5pt (112x112) -> ArcFace ONNX embedding -> cosine
+distance to DB.
 
 This is the identity-verification half of whole-person tracking (src/whole_person_tracker.py);
 the body-detection half lives in src/person_detector.py.
@@ -22,7 +23,10 @@ import mediapipe as mp
 from mediapipe.tasks.python import vision as mp_vision
 from mediapipe.tasks.python import BaseOptions
 
-from .haar_5pt import align_face_5pt, _DEFAULT_MODEL_PATH, _DEFAULT_CASCADE_PATH
+from .align import align_face_5pt
+from .face_detector import FaceBoxDetector, _DEFAULT_MODEL_PATH as _DEFAULT_FACE_DETECTOR_MODEL
+
+_DEFAULT_LANDMARKER_MODEL = Path(__file__).parent.parent / "models" / "face_landmarker.task"
 
 
 @dataclass
@@ -129,23 +133,20 @@ class FaceDBMatcher:
         )
 
 
-class HaarFaceMesh5pt:
-    """Multi-face: Haar (multi) -> per-face-ROI MediaPipe FaceLandmarker 5pt."""
+class MultiFaceDetector:
+    """Multi-face: MediaPipe FaceDetector (BlazeFace) -> per-face-ROI MediaPipe FaceLandmarker 5pt."""
 
     def __init__(
         self,
-        haar_xml: Optional[str] = None,
-        model_path: str = _DEFAULT_MODEL_PATH,
-        min_size: Tuple[int, int] = (70, 70),
-        haar_hold_frames: int = 2,
+        face_detector_model: str = _DEFAULT_FACE_DETECTOR_MODEL,
+        landmarker_model: str = str(_DEFAULT_LANDMARKER_MODEL),
+        min_confidence: float = 0.5,
+        max_dim: int = 640,
     ):
-        self.min_size = tuple(map(int, min_size))
-        self.face_cascade = cv2.CascadeClassifier(haar_xml or _DEFAULT_CASCADE_PATH)
-        if self.face_cascade.empty():
-            raise RuntimeError(f"Failed to load Haar cascade: {haar_xml or _DEFAULT_CASCADE_PATH}")
+        self.box_detector = FaceBoxDetector(model_path=face_detector_model, min_confidence=min_confidence, max_dim=max_dim)
 
         options = mp_vision.FaceLandmarkerOptions(
-            base_options=BaseOptions(model_asset_path=model_path),
+            base_options=BaseOptions(model_asset_path=landmarker_model),
             running_mode=mp_vision.RunningMode.IMAGE,
             num_faces=1,
             min_face_detection_confidence=0.5,
@@ -154,25 +155,9 @@ class HaarFaceMesh5pt:
         self.landmarker = mp_vision.FaceLandmarker.create_from_options(options)
         self.IDX = (33, 263, 1, 61, 291)  # left eye, right eye, nose, mouth left, mouth right
 
-        # Haar misses individual frames often even with a face held steady; briefly hold
-        # the last boxes across a miss instead of reporting zero faces for a frame.
-        self._last_boxes = np.zeros((0, 4), dtype=np.int32)
-        self._missed = 0
-        self.haar_hold_frames = haar_hold_frames
-
     def close(self) -> None:
+        self.box_detector.close()
         self.landmarker.close()
-
-    def _haar_faces(self, gray: np.ndarray) -> np.ndarray:
-        faces = self.face_cascade.detectMultiScale(
-            gray, scaleFactor=1.1, minNeighbors=5, flags=cv2.CASCADE_SCALE_IMAGE, minSize=self.min_size,
-        )
-        if faces is None or len(faces) == 0:
-            self._missed += 1
-            return self._last_boxes if self._missed <= self.haar_hold_frames else np.zeros((0, 4), dtype=np.int32)
-        self._missed = 0
-        self._last_boxes = faces.astype(np.int32)
-        return self._last_boxes
 
     def _roi_landmarks_5pt(self, roi_bgr: np.ndarray) -> Optional[np.ndarray]:
         H, W = roi_bgr.shape[:2]
@@ -192,17 +177,15 @@ class HaarFaceMesh5pt:
 
     def detect(self, frame_bgr: np.ndarray, max_faces: int = 8) -> List[FaceDet]:
         H, W = frame_bgr.shape[:2]
-        faces = self._haar_faces(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY))
-        if faces.shape[0] == 0:
+        faces = self.box_detector.detect(frame_bgr, max_faces=max_faces)
+        if not faces:
             return []
 
-        areas = faces[:, 2] * faces[:, 3]
-        faces = faces[np.argsort(areas)[::-1]][:max_faces]
-
         out: List[FaceDet] = []
-        for (x, y, w, h) in faces:
+        for face in faces:
+            w, h = face.x2 - face.x1, face.y2 - face.y1
             mx, my = 0.25 * w, 0.35 * h
-            rx1, ry1, rx2, ry2 = _clip_xyxy(x - mx, y - my, x + w + mx, y + h + my, W, H)
+            rx1, ry1, rx2, ry2 = _clip_xyxy(face.x1 - mx, face.y1 - my, face.x2 + mx, face.y2 + my, W, H)
             kps_roi = self._roi_landmarks_5pt(frame_bgr[ry1:ry2, rx1:rx2])
             if kps_roi is None:
                 continue

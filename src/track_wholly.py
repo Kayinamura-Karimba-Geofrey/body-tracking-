@@ -24,7 +24,7 @@ from typing import Optional, TextIO
 import cv2
 
 from .camera import pick_camera_index
-from .face_pipeline import ArcFaceEmbedderONNX, FaceDBMatcher, HaarFaceMesh5pt, load_db_npz
+from .face_pipeline import ArcFaceEmbedderONNX, FaceDBMatcher, MultiFaceDetector, load_db_npz
 from .identity_state import IdentityState
 from .person_detector import PersonDetector
 from .whole_person_tracker import WholePersonTracker
@@ -72,6 +72,10 @@ def main():
     parser.add_argument("--target", required=True, help="enrolled identity to lock onto")
     parser.add_argument("--camera", type=int, default=None)
     parser.add_argument("--threshold", type=float, default=0.34, help="ArcFace cosine-distance accept threshold")
+    parser.add_argument("--face-detect-conf", type=float, default=0.5, help="BlazeFace min detection confidence")
+    parser.add_argument("--person-detect-conf", type=float, default=0.4, help="EfficientDet-Lite0 min person-detection confidence")
+    parser.add_argument("--body-detect-every", type=int, default=2,
+                         help="run the (expensive) person detector every N frames; continuity carries the box between")
     parser.add_argument("--decay-rate", type=float, default=0.35, help="per-second confidence decay while TEMPORARY")
     parser.add_argument("--temporary-floor", type=float, default=0.35, help="confidence below this -> UNKNOWN")
     parser.add_argument("--log", default=None, help="CSV path to record state/confidence per frame for evaluation")
@@ -84,12 +88,13 @@ def main():
         datefmt="%H:%M:%S",
     )
 
-    face_detector = HaarFaceMesh5pt(min_size=(70, 70))
+    face_detector = MultiFaceDetector(min_confidence=args.face_detect_conf)
     embedder = ArcFaceEmbedderONNX()
     matcher = FaceDBMatcher(load_db_npz(Path("data/db/face_db.npz")), dist_thresh=args.threshold)
-    body_detector = PersonDetector()
+    body_detector = PersonDetector(min_confidence=args.person_detect_conf)
 
-    tracker = WholePersonTracker(args.target, face_detector, embedder, matcher, body_detector)
+    tracker = WholePersonTracker(args.target, face_detector, embedder, matcher, body_detector,
+                                  body_detect_every=args.body_detect_every)
     tracker.identity.decay_rate = args.decay_rate
     tracker.identity.temporary_floor = args.temporary_floor
 
