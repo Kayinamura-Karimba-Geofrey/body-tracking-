@@ -76,6 +76,8 @@ def main():
     parser.add_argument("--person-detect-conf", type=float, default=0.4, help="EfficientDet-Lite0 min person-detection confidence")
     parser.add_argument("--body-detect-every", type=int, default=2,
                          help="run the (expensive) person detector every N frames; continuity carries the box between")
+    parser.add_argument("--appearance-threshold", type=float, default=0.55,
+                         help="min torso-histogram correlation to re-acquire by appearance alone (e.g. back turned)")
     parser.add_argument("--decay-rate", type=float, default=0.35, help="per-second confidence decay while TEMPORARY")
     parser.add_argument("--temporary-floor", type=float, default=0.35, help="confidence below this -> UNKNOWN")
     parser.add_argument("--log", default=None, help="CSV path to record state/confidence per frame for evaluation")
@@ -93,8 +95,16 @@ def main():
     matcher = FaceDBMatcher(load_db_npz(Path("data/db/face_db.npz")), dist_thresh=args.threshold)
     body_detector = PersonDetector(min_confidence=args.person_detect_conf)
 
+    appearance_db = load_db_npz(Path("data/db/appearance_db.npz"))
+    appearance_signature = appearance_db.get(args.target)
+    if appearance_signature is None:
+        logger.warning("no appearance signature enrolled for %r - back-turned/occluded re-acquisition "
+                        "will fall back to face-only (see src/enroll.py)", args.target)
+
     tracker = WholePersonTracker(args.target, face_detector, embedder, matcher, body_detector,
-                                  body_detect_every=args.body_detect_every)
+                                  body_detect_every=args.body_detect_every,
+                                  appearance_signature=appearance_signature,
+                                  appearance_threshold=args.appearance_threshold)
     tracker.identity.decay_rate = args.decay_rate
     tracker.identity.temporary_floor = args.temporary_floor
 

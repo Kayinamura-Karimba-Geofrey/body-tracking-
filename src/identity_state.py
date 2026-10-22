@@ -16,6 +16,13 @@ UNKNOWN    - confidence has decayed past the floor, or body continuity
              the locked box belongs to; only a fresh face match can
              re-establish CONFIRMED.
 
+A body can also be re-acquired by clothing/torso appearance alone (see
+src/appearance.py) when no face is visible at all - most importantly
+someone whose back is turned, who by definition has no face to check.
+That's weaker evidence than a face match, so confirm_by_appearance()
+always lands in TEMPORARY, decaying like any other TEMPORARY state;
+appearance alone can never produce CONFIRMED.
+
 decay: confidence(t) = exp(-decay_rate * seconds_since_confirmed)
 """
 
@@ -74,6 +81,22 @@ class IdentityConfidence:
         self.state = IdentityState.CONFIRMED
         self._confirmed_at = now
         self._unknown_at = None
+
+    def confirm_by_appearance(self, confidence: float = 0.6, now: Optional[float] = None) -> None:
+        """
+        Call when a body was re-acquired by torso/clothing appearance alone
+        (no face available to check - e.g. back turned). Lands in TEMPORARY
+        at the given starting confidence, which then decays normally; never
+        CONFIRMED, since appearance alone is weaker evidence than a face match.
+        """
+        now = now if now is not None else time.time()
+        confidence = min(max(confidence, 1e-6), 0.999)
+        elapsed = -math.log(confidence) / self.decay_rate
+        self._confirmed_at = now - elapsed
+        self._unknown_at = None
+        if self.state != IdentityState.TEMPORARY:
+            logger.info("identity TEMPORARY (reacquired by appearance, confidence=%.2f)", confidence)
+        self.state = IdentityState.TEMPORARY
 
     def hold_without_face(self, body_continuity_ok: bool, now: Optional[float] = None) -> IdentitySnapshot:
         """

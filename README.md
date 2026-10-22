@@ -67,6 +67,38 @@ If a *different* enrolled identity's face appears on the locked body (a
 path crossing that actually swapped who's standing there), the lock is
 dropped immediately rather than kept on the wrong person.
 
+## Appearance re-identification (`src/appearance.py`)
+
+A face can only ever confirm identity when it's visible - which, by
+definition, is never true with someone's back turned. `src/appearance.py`
+extracts a color histogram of the torso/clothing band of the body box and
+compares it to a signature captured at enrollment across all four
+orientations (see **Enroll a target** below). It's used two ways:
+
+- **Ongoing reinforcement**: while the body is still continuity-tracked
+  but no face is visible (`src/whole_person_tracker.py`'s
+  `_reinforce_or_hold`), a matching appearance keeps confidence pinned at
+  a `TEMPORARY` plateau (confidence 0.6) instead of free-decaying to
+  `UNKNOWN` - this is what makes an extended back-turn survive as long as
+  the person stays in frame, rather than the lock dying out after a few
+  seconds regardless of whether they're still right there.
+- **Re-acquisition**: if continuity itself breaks (occlusion, path
+  crossing) or the target was never locked with a face this frame,
+  appearance alone can re-find the right body among candidates.
+
+Either way it only ever lands in `TEMPORARY`, never `CONFIRMED` - clothing
+can repeat across people and lighting shifts the histogram, so it's
+deliberately weaker evidence than a face match (`IdentityConfidence.
+confirm_by_appearance`, `src/identity_state.py`).
+
+Measured on a 4-phase FRONT/LEFT/BACK/RIGHT rotation after this was wired
+in: state never dropped to `UNKNOWN` once, oscillating `CONFIRMED` (face
+visible) / `TEMPORARY @ 0.6` (face hidden, appearance reinforced) with 7
+clean `TEMPORARY -> CONFIRMED` recoveries and zero `UNKNOWN` episodes -
+before this fix, the same rotation spent 7+ continuous seconds stuck in
+`UNKNOWN` the moment the back-turn pushed confidence past the decay floor,
+because nothing re-applied appearance evidence while continuity was intact.
+
 ## Setup
 
 ```bash
@@ -123,12 +155,19 @@ Each was run end-to-end against a live webcam (`/dev/video0`) and a real
 ### 1. Enroll a target
 
 ```bash
-python -m src.enroll
+python -m src.enroll --name "SomeName"
+# or omit --name to be prompted interactively
 ```
 
-Interactive: type a name, aim the camera at them, `SPACE` to capture a
-sample (or `a` to auto-capture), `s` to save once you have a handful of
-samples, `q` to quit. Writes `data/db/face_db.npz`.
+Walks the person through four rotation phases, 3.5s each (`--phase-seconds`
+to change it): **FRONT**, **LEFT**, **BACK**, **RIGHT**, shown on screen
+and printed to the console as it goes. Captures a face embedding whenever
+a face is visible (mainly FRONT and the profile phases) and a torso
+appearance signature every phase, including BACK where there's no face at
+all - averaging the appearance signature across all four orientations is
+what lets `--appearance-threshold` re-identify the person regardless of
+which way they're facing. Saves `data/db/face_db.npz` and
+`data/db/appearance_db.npz`. `q` aborts without saving.
 
 ### 2. Track
 
@@ -142,9 +181,13 @@ analysis. Useful flags: `--camera N` (force a camera index),
 `--threshold` (ArcFace accept threshold), `--face-detect-conf` /
 `--person-detect-conf` (detector confidence thresholds), `--body-detect-every`
 (how often the expensive person detector reruns - see **Performance**),
-`--decay-rate` / `--temporary-floor` (tune how fast TEMPORARY decays and
-when it drops to UNKNOWN), `--debug` (verbose per-frame logs). Press `q`
-to quit.
+`--appearance-threshold` (min torso-histogram correlation to trust an
+appearance match - see **Appearance re-identification**), `--decay-rate` /
+`--temporary-floor` (tune how fast TEMPORARY decays and when it drops to
+UNKNOWN), `--debug` (verbose per-frame logs). Press `q` to quit. If the
+target has no entry in `data/db/appearance_db.npz` (enrolled before this
+feature existed, or enrolled via an older version of `enroll.py`), a
+warning is logged and tracking falls back to face-only re-acquisition.
 
 ### 3. Evaluate a recorded run
 
@@ -165,7 +208,7 @@ Run from this directory with the `.venv` described above:
 .venv/bin/python -m src.track_wholly --help                       # CLI parses
 .venv/bin/python -m src.track_wholly --target X --log runs/t.csv  # opens camera, detects, logs CSV, q to quit
 .venv/bin/python -m src.evaluate runs/t.csv                       # summarizes the CSV
-.venv/bin/python -m src.enroll                                    # opens camera, enroll UI
+.venv/bin/python -m src.enroll --name X                           # 4-phase rotation capture
 ```
 
 All five ran clean (no tracebacks) against the real webcam at `/dev/video0`
@@ -192,6 +235,12 @@ webcam and check the resulting state sequence:
   continuity (`TEMPORARY`) or drop to `UNKNOWN`/`SEARCHING` if the body
   detector loses the box - and never silently relabel the lock onto the
   second person.
+- **Back turned** (needs an `appearance_db.npz` entry - see **Enroll a
+  target**): get `CONFIRMED`, then turn your back and stay turned for
+  10+ seconds. Expect `CONFIRMED -> TEMPORARY` holding around confidence
+  0.6 for as long as your back is turned, *not* decaying into `UNKNOWN` -
+  turn back around and expect a clean `TEMPORARY -> CONFIRMED` once your
+  face is matched again.
 
 ## Module layout
 
@@ -201,9 +250,10 @@ webcam and check the resulting state sequence:
 | `src/face_detector.py` | BlazeFace whole-frame multi-face box detection (MediaPipe FaceDetector). |
 | `src/face_pipeline.py` | `MultiFaceDetector` (BlazeFace + per-ROI FaceLandmarker 5pt) + ArcFace embed + DB match. |
 | `src/align.py` | Detector-agnostic ArcFace 5pt alignment warp. |
+| `src/appearance.py` | Torso/clothing color-histogram signature + comparison, for re-identification without a face. |
 | `src/association.py` | Maps each detected face to the body box it sits on. |
 | `src/identity_state.py` | The three-state confidence model, decoupled from boxes/frames. |
 | `src/whole_person_tracker.py` | Integrates the above: acquire, body-continuity tracking, throttled re-verification, centering signal. |
 | `src/track_wholly.py` | CLI entry point: camera loop, overlay, CSV logging. |
 | `src/evaluate.py` | Summarizes a logged run. |
-| `src/enroll.py` | Enrolls a target identity into `data/db/face_db.npz`. |
+| `src/enroll.py` | Guided FRONT/LEFT/BACK/RIGHT enrollment into `data/db/face_db.npz` and `data/db/appearance_db.npz`. |

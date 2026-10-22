@@ -1,23 +1,23 @@
 # src/enroll.py
 """
-Enrollment: camera -> MultiFaceDetector (BlazeFace + FaceLandmarker 5pt) ->
-align_face_5pt (112x112) -> ArcFace embedding. Stores the mean L2-normalized
-embedding per identity in data/db/face_db.npz, read by WholePersonTracker's
-FaceDBMatcher (src/face_pipeline.py).
+Enrollment: guides the person through FRONT / LEFT / BACK / RIGHT turns so
+the target is recognizable from any orientation, not just facing the
+camera - a face embedding alone is useless once someone turns away, which
+is exactly the gap src/appearance.py exists to close for tracking.
 
-Run (interactive):
-    python -m src.enroll
+Per phase: camera -> MultiFaceDetector (face embedding, when a face is
+visible - mainly FRONT) and PersonDetector (torso appearance signature,
+every phase including BACK, since clothing doesn't need a face). Saves
+the mean face embedding to data/db/face_db.npz and the mean appearance
+signature (averaged across all four orientations, so it generalizes) to
+data/db/appearance_db.npz.
 
-Controls:
-    SPACE : capture one sample
-    a     : toggle auto-capture
-    s     : save enrollment (needs a handful of samples)
-    q     : quit
+Run:
+    python -m src.enroll --name Alice
+    python -m src.enroll --name Alice --phase-seconds 5   # slower, e.g. for testing
 
-Run (non-interactive, e.g. scripted/headless):
-    python -m src.enroll --name Alice --duration 10
-Captures automatically for --duration seconds and saves at the end if
-enough samples were found - no keyboard input needed.
+Shows a live window with on-screen rotation prompts; 'q' aborts. Falls
+back to console-only progress if no display is available.
 """
 
 from __future__ import annotations
@@ -25,148 +25,163 @@ from __future__ import annotations
 import argparse
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
 from .align import align_face_5pt
+from .appearance import torso_signature
 from .camera import pick_camera_index
 from .face_pipeline import ArcFaceEmbedderONNX, MultiFaceDetector, load_db_npz
+from .person_detector import PersonDetector
 
-DB_PATH = Path("data/db/face_db.npz")
-SAMPLES_NEEDED = 15
+FACE_DB_PATH = Path("data/db/face_db.npz")
+APPEARANCE_DB_PATH = Path("data/db/appearance_db.npz")
+SAMPLES_NEEDED = 10
+
+PHASES: List[Tuple[str, str]] = [
+    ("FRONT", "Face the camera"),
+    ("LEFT", "Turn to show your LEFT side"),
+    ("BACK", "Turn your BACK to the camera"),
+    ("RIGHT", "Turn to show your RIGHT side"),
+]
+
+
+def _normalize(v: np.ndarray) -> np.ndarray:
+    n = np.linalg.norm(v) + 1e-12
+    return (v / n).astype(np.float32)
 
 
 def mean_embedding(embeddings: List[np.ndarray]) -> np.ndarray:
-    m = np.stack(embeddings, axis=0).mean(axis=0)
-    return (m / (np.linalg.norm(m) + 1e-12)).astype(np.float32)
+    return _normalize(np.stack(embeddings, axis=0).mean(axis=0))
 
 
-def save_db(db: Dict[str, np.ndarray]) -> None:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(DB_PATH, **{k: v.astype(np.float32) for k, v in db.items()})
+def mean_signature(signatures: List[np.ndarray]) -> np.ndarray:
+    m = np.stack(signatures, axis=0).mean(axis=0)
+    s = m.sum()
+    return (m / s if s > 0 else m).astype(np.float32)
 
 
-def _open_camera() -> cv2.VideoCapture:
+def save_db(path: Path, db: Dict[str, np.ndarray]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(path, **{k: v.astype(np.float32) for k, v in db.items()})
+
+
+def _try_imshow(window: str, frame: np.ndarray) -> bool:
+    try:
+        cv2.imshow(window, frame)
+        return True
+    except cv2.error:
+        return False
+
+
+def run_enrollment(name: str, phase_seconds: float = 3.5, capture_every: float = 0.2) -> None:
+    face_detector = MultiFaceDetector()
+    body_detector = PersonDetector()
+    embedder = ArcFaceEmbedderONNX()
+
+    face_db = load_db_npz(FACE_DB_PATH)
+    appearance_db = load_db_npz(APPEARANCE_DB_PATH)
+    face_samples: List[np.ndarray] = []
+    appearance_samples: List[np.ndarray] = []
+
     cap = cv2.VideoCapture(pick_camera_index())
     if not cap.isOpened():
         raise RuntimeError("Failed to open camera.")
-    return cap
 
-
-def run_interactive(name: str) -> None:
-    det = MultiFaceDetector()
-    embedder = ArcFaceEmbedderONNX()
-    db = load_db_npz(DB_PATH)
-    samples: List[np.ndarray] = []
-    auto = False
-    last_auto = 0.0
-
-    cap = _open_camera()
-    print("Controls: SPACE=capture, a=auto-capture, s=save, q=quit")
+    window_available = True
+    aborted = False
     try:
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
+        for phase_name, instruction in PHASES:
+            print(f"[{phase_name}] {instruction} ({phase_seconds:.0f}s)")
+            last_capture = 0.0
+            deadline = time.time() + phase_seconds
+            phase_faces = phase_bodies = 0
 
-            vis = frame.copy()
-            faces = det.detect(frame, max_faces=1)
-            aligned = None
-            if faces:
-                f = faces[0]
-                cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), (0, 255, 0), 2)
-                aligned, _ = align_face_5pt(frame, f.kps, out_size=(112, 112))
+            while time.time() < deadline:
+                ok, frame = cap.read()
+                if not ok:
+                    break
 
-            now = time.time()
-            if auto and aligned is not None and now - last_auto >= 0.25:
-                samples.append(embedder.embed(aligned))
-                last_auto = now
-
-            cv2.putText(vis, f"{name}: {len(samples)}/{SAMPLES_NEEDED} samples "
-                             f"(auto={'ON' if auto else 'OFF'})",
-                        (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
-            cv2.imshow("enroll", vis)
-
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
-                break
-            elif key == ord("a"):
-                auto = not auto
-            elif key == ord(" ") and aligned is not None:
-                samples.append(embedder.embed(aligned))
-                print(f"captured ({len(samples)})")
-            elif key == ord("s"):
-                if len(samples) < max(3, SAMPLES_NEEDED // 2):
-                    print(f"not enough samples yet ({len(samples)})")
-                    continue
-                db[name] = mean_embedding(samples)
-                save_db(db)
-                print(f"saved '{name}' to {DB_PATH} ({len(db)} identities total)")
-                samples.clear()
-    finally:
-        det.close()
-        cap.release()
-        cv2.destroyAllWindows()
-
-
-def run_auto(name: str, duration: float, capture_every: float = 0.25) -> None:
-    det = MultiFaceDetector()
-    embedder = ArcFaceEmbedderONNX()
-    db = load_db_npz(DB_PATH)
-    samples: List[np.ndarray] = []
-    last_capture = 0.0
-    frames_seen = 0
-    frames_with_face = 0
-
-    cap = _open_camera()
-    print(f"Auto-enrolling '{name}' for {duration:.0f}s - face the camera now.")
-    try:
-        deadline = time.time() + duration
-        while time.time() < deadline:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            frames_seen += 1
-
-            faces = det.detect(frame, max_faces=1)
-            if faces:
-                frames_with_face += 1
-                aligned, _ = align_face_5pt(frame, faces[0].kps, out_size=(112, 112))
+                faces = face_detector.detect(frame, max_faces=1)
+                bodies = body_detector.detect(frame, max_people=1)
                 now = time.time()
-                if aligned is not None and now - last_capture >= capture_every:
-                    samples.append(embedder.embed(aligned))
-                    last_capture = now
-    finally:
-        det.close()
-        cap.release()
 
-    print(f"frames_seen={frames_seen} frames_with_face={frames_with_face} samples={len(samples)}")
-    if len(samples) < max(3, SAMPLES_NEEDED // 2):
-        print(f"not enough samples captured ({len(samples)}) - no face was detected for most of "
-              f"the window. Make sure you're facing the camera and well lit, then try again.")
+                if now - last_capture >= capture_every:
+                    if faces:
+                        aligned, _ = align_face_5pt(frame, faces[0].kps, out_size=(112, 112))
+                        if aligned is not None:
+                            face_samples.append(embedder.embed(aligned))
+                            phase_faces += 1
+                    if bodies:
+                        b = bodies[0]
+                        appearance_samples.append(torso_signature(frame, (b.x1, b.y1, b.x2, b.y2)))
+                        phase_bodies += 1
+                    last_capture = now
+
+                if window_available:
+                    vis = frame.copy()
+                    if faces:
+                        f = faces[0]
+                        cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), (0, 255, 0), 2)
+                    if bodies:
+                        b = bodies[0]
+                        cv2.rectangle(vis, (b.x1, b.y1), (b.x2, b.y2), (255, 170, 0), 2)
+                    remaining = max(0.0, deadline - time.time())
+                    cv2.putText(vis, f"{name}: {phase_name} - {instruction}", (10, 28),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+                    cv2.putText(vis, f"{remaining:.1f}s  faces={len(face_samples)} appearance={len(appearance_samples)}",
+                                (10, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 2)
+                    window_available = _try_imshow("enroll", vis)
+                    if window_available and (cv2.waitKey(1) & 0xFF) == ord("q"):
+                        aborted = True
+                        break
+
+            print(f"  captured {phase_faces} face samples, {phase_bodies} appearance samples this phase")
+            if aborted:
+                break
+    finally:
+        face_detector.close()
+        body_detector.close()
+        cap.release()
+        if window_available:
+            cv2.destroyAllWindows()
+
+    if aborted:
+        print("aborted, nothing saved.")
         return
 
-    db[name] = mean_embedding(samples)
-    save_db(db)
-    print(f"saved '{name}' to {DB_PATH} ({len(db)} identities total, {len(samples)} samples averaged)")
+    print(f"total: {len(face_samples)} face samples, {len(appearance_samples)} appearance samples")
+    if len(face_samples) < SAMPLES_NEEDED:
+        print(f"not enough face samples ({len(face_samples)}/{SAMPLES_NEEDED}) - make sure you were "
+              f"facing the camera during the FRONT phase and well lit, then try again.")
+        return
+    if len(appearance_samples) < SAMPLES_NEEDED:
+        print(f"not enough appearance samples ({len(appearance_samples)}/{SAMPLES_NEEDED}) - make sure "
+              f"your whole body was in frame, then try again.")
+        return
+
+    face_db[name] = mean_embedding(face_samples)
+    appearance_db[name] = mean_signature(appearance_samples)
+    save_db(FACE_DB_PATH, face_db)
+    save_db(APPEARANCE_DB_PATH, appearance_db)
+    print(f"saved '{name}': {FACE_DB_PATH} ({len(face_db)} identities), "
+          f"{APPEARANCE_DB_PATH} ({len(appearance_db)} identities)")
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--name", default=None, help="identity to enroll; omit for interactive mode")
-    parser.add_argument("--duration", type=float, default=10.0, help="auto-capture window in seconds (--name mode only)")
+    parser.add_argument("--name", default=None, help="identity to enroll; prompted if omitted")
+    parser.add_argument("--phase-seconds", type=float, default=3.5,
+                         help="seconds to hold each of the 4 rotation phases (FRONT/LEFT/BACK/RIGHT)")
     args = parser.parse_args()
 
-    if args.name:
-        run_auto(args.name, args.duration)
-    else:
-        name = input("Enter person name to enroll (e.g., Alice): ").strip()
-        if not name:
-            print("No name provided. Exiting.")
-            return
-        run_interactive(name)
+    name = args.name or input("Enter person name to enroll (e.g., Alice): ").strip()
+    if not name:
+        print("No name provided. Exiting.")
+        return
+    run_enrollment(name, phase_seconds=args.phase_seconds)
 
 
 if __name__ == "__main__":

@@ -24,6 +24,14 @@ expensive per-ROI FaceLandmarker + ArcFace embedding pass (needed for
 every other locked frame uses the cheap BlazeFace-only box pass (no
 landmarker) just to answer *is a face visible there at all*, which is
 all the TEMPORARY/CONFIRMED transition needs most frames.
+
+Appearance (src/appearance.py): a face can only ever confirm identity
+when it's visible, which by definition never happens with someone's back
+turned. An optional torso/clothing appearance signature (captured across
+all four orientations at enrollment) lets the tracker re-acquire a lost
+target - or disambiguate a crowded continuity match - using *where they
+are and what they're wearing* instead, landing honestly in TEMPORARY
+rather than CONFIRMED (see IdentityConfidence.confirm_by_appearance).
 """
 
 from __future__ import annotations
@@ -34,6 +42,7 @@ from typing import List, Optional
 
 import numpy as np
 
+from .appearance import compare_signatures, torso_signature
 from .association import associate_faces_to_bodies
 from .face_pipeline import ArcFaceEmbedderONNX, FaceDBMatcher, FaceDet, MultiFaceDetector, identity_of
 from .identity_state import IdentityConfidence, IdentitySnapshot, IdentityState
@@ -70,6 +79,8 @@ class WholePersonTracker:
         body_detect_every: int = 2,
         ema_alpha: float = 0.30,
         dead_zone: float = 0.07,
+        appearance_signature: Optional[np.ndarray] = None,
+        appearance_threshold: float = 0.55,
     ):
         self.target_name = target_name
         self.face_detector = face_detector
@@ -80,6 +91,8 @@ class WholePersonTracker:
         self.body_detect_every = max(1, body_detect_every)
         self.ema_alpha = ema_alpha
         self.dead_zone = dead_zone
+        self.appearance_signature = appearance_signature
+        self.appearance_threshold = appearance_threshold
 
         self.identity = IdentityConfidence()
         self.locked_body: Optional[BodyDet] = None
@@ -102,8 +115,10 @@ class WholePersonTracker:
                 return body
         return None
 
-    def _associate_body(self, bodies: List[BodyDet]) -> Optional[BodyDet]:
-        """Carries the locked body box forward frame-to-frame by spatial continuity alone."""
+    def _associate_body(self, frame, bodies: List[BodyDet]) -> Optional[BodyDet]:
+        """Carries the locked body box forward frame-to-frame by spatial continuity,
+        blended with appearance similarity when available - the latter is what keeps
+        the lock on the right person rather than a nearby one in a path crossing."""
         if self.locked_body is None or not bodies:
             return None
         if len(bodies) == 1:
@@ -117,9 +132,43 @@ class WholePersonTracker:
         for body in bodies:
             box = self._box(body)
             score = iou(last_box, box) - 0.20 * (np.linalg.norm(center(box) - last_center) / last_diag)
+            if self.appearance_signature is not None:
+                sig = torso_signature(frame, box)
+                score += 0.30 * compare_signatures(sig, self.appearance_signature)
             if score > best_score:
                 best_score, best_body = score, body
         return best_body if best_score > -0.45 else None
+
+    def _reinforce_or_hold(self, frame, candidate: BodyDet) -> None:
+        """Call when the locked body is still continuity-tracked but no face confirmed it
+        this frame. Appearance is a weaker, ongoing signal (not just a one-time rescue on
+        continuity break) - without this, a sustained back-turn free-decays through
+        TEMPORARY into UNKNOWN and then just sits there for as long as the person's back
+        stays turned, even though the same tracked body keeps matching their clothing the
+        whole time."""
+        if self.appearance_signature is not None:
+            sig = torso_signature(frame, self._box(candidate))
+            if compare_signatures(sig, self.appearance_signature) >= self.appearance_threshold:
+                self.identity.confirm_by_appearance()
+                return
+        self.identity.hold_without_face(body_continuity_ok=True)
+
+    def _acquire_by_appearance(self, frame, bodies: List[BodyDet]) -> Optional[BodyDet]:
+        """Re-acquires by torso/clothing appearance alone - no face required, so this
+        is what lets the tracker find the target again even with their back turned."""
+        if self.appearance_signature is None or not bodies:
+            return None
+        best_score, best_body = -1.0, None
+        for body in bodies:
+            sig = torso_signature(frame, self._box(body))
+            score = compare_signatures(sig, self.appearance_signature)
+            if score > best_score:
+                best_score, best_body = score, body
+        if best_body is not None and best_score >= self.appearance_threshold:
+            logger.info("re-acquired %r by appearance: body=%s score=%.3f",
+                        self.target_name, self._box(best_body), best_score)
+            return best_body
+        return None
 
     def _face_on_locked_body(self, faces: List[FaceDet], bodies: List[BodyDet], candidate_body: BodyDet) -> Optional[FaceDet]:
         face_bodies = associate_faces_to_bodies(faces, bodies)
@@ -154,23 +203,37 @@ class WholePersonTracker:
             # the target in the first place, not the steady-state tracking loop
             faces = self.face_detector.detect(frame, max_faces=8)
             candidate = self._acquire(frame, faces, bodies)
-            if candidate is None:
-                self.identity.tick_unknown()
-                return None
-            self.locked_body = candidate
-            self.identity.confirm()
-            face = self._face_on_locked_body(faces, bodies, candidate)
-        else:
-            candidate = self._associate_body(bodies)
-            if candidate is None:
-                self.identity.hold_without_face(body_continuity_ok=False)
-                self.identity.tick_unknown()
-                if self.identity.state == IdentityState.SEARCHING:
-                    self.locked_body = None
-                    self.smooth_center = None
+            if candidate is not None:
+                self.locked_body = candidate
+                self.identity.confirm()
+                face = self._face_on_locked_body(faces, bodies, candidate)
+            else:
+                # no face match this frame (e.g. target's back is turned) - fall back
+                # to appearance alone, so the tracker can still find them
+                candidate = self._acquire_by_appearance(frame, bodies)
+                if candidate is None:
+                    self.identity.tick_unknown()
                     return None
-                # briefly keep reporting the last known box while UNKNOWN, honestly
-                # flagged as such, instead of the output disappearing outright
+                self.locked_body = candidate
+                self.identity.confirm_by_appearance()
+        else:
+            candidate = self._associate_body(frame, bodies)
+            if candidate is None:
+                # continuity broke (occlusion / path crossing) - try an immediate
+                # appearance-based re-lock rather than waiting out the UNKNOWN timeout
+                candidate = self._acquire_by_appearance(frame, bodies)
+                if candidate is not None:
+                    self.locked_body = candidate
+                    self.identity.confirm_by_appearance()
+                else:
+                    self.identity.hold_without_face(body_continuity_ok=False)
+                    self.identity.tick_unknown()
+                    if self.identity.state == IdentityState.SEARCHING:
+                        self.locked_body = None
+                        self.smooth_center = None
+                        return None
+                    # briefly keep reporting the last known box while UNKNOWN, honestly
+                    # flagged as such, instead of the output disappearing outright
             else:
                 self.locked_body = candidate
                 if due:
@@ -192,16 +255,16 @@ class WholePersonTracker:
                             self.smooth_center = None
                             return None
                         else:
-                            self.identity.hold_without_face(body_continuity_ok=True)
+                            self._reinforce_or_hold(frame, candidate)
                     else:
-                        self.identity.hold_without_face(body_continuity_ok=True)
+                        self._reinforce_or_hold(frame, candidate)
                 else:
                     # cheap pass: only need to know a face is there, not whose -
                     # the landmarker + ArcFace embedding cost is skipped entirely
                     face_boxes = self.face_detector.box_detector.detect(frame, max_faces=8)
                     face_bodies = associate_faces_to_bodies(face_boxes, bodies)
                     if not any(b is candidate for b in face_bodies):
-                        self.identity.hold_without_face(body_continuity_ok=True)
+                        self._reinforce_or_hold(frame, candidate)
 
         snapshot = self.identity.snapshot()
         box = self._box(self.locked_body)
