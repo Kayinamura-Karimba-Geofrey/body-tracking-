@@ -140,7 +140,12 @@ class WholePersonTracker:
         self.frame_index += 1
         bodies = self._detect_bodies(frame)
 
-        due = self.identity.state != IdentityState.CONFIRMED or self.frame_index % self.verify_every == 0
+        # phase-offset by 1 so periodic re-verification frames don't land on the same
+        # frame as periodic body re-detection (both are expensive; stacking them on one
+        # frame is what caused the visible stutter every body_detect_every*verify_every
+        # frames - e.g. every 10th frame when body_detect_every=2, verify_every=10,
+        # both anchored at 0)
+        due = self.identity.state != IdentityState.CONFIRMED or self.frame_index % self.verify_every == 1
         face: Optional[FaceDet] = None
 
         if self.locked_body is None:
